@@ -1,6 +1,5 @@
 /**
  *  Flic Integration (Buttons & Twist) V1.0
- *  Produced by Robin Winbourne, with a LOT of help from Chat GPT :)
  */
 
 import groovy.json.JsonOutput
@@ -433,26 +432,7 @@ def configureDevicePage() {
         ensureConfiguredShell(bdaddr, b, inferredType)
 
         section("") {
-            def cfgEntry = (state.configured ?: [:])[bdaddr]
-            Integer currentNum = null
-            try { currentNum = (cfgEntry?.flicNum as Integer) } catch (ignored) { currentNum = null }
-
-            paragraph "Device Name: ${b.name}\nDevice Type: ${inferredType}" + (currentNum ? "\nUnique Device Number: flic${currentNum}" : "")
-
-            // Allow manual edit of HE<>Flic number, enforcing uniqueness
-            String flicNumKey = k(bdaddr, "flic_num")
-            Set<Integer> usedNums = usedFlicNums(bdaddr)
-
-            input flicNumKey, "number",
-                title: "Edit Device Number (unique number used to configure actions in the Flic mobile app):",
-                required: true,
-                defaultValue: (settings[flicNumKey] != null ? settings[flicNumKey] : currentNum),
-                submitOnChange: true
-
-            Integer desiredNum = safeInt(settings[flicNumKey], currentNum)
-            if (desiredNum != null && desiredNum > 0 && usedNums.contains(desiredNum)) {
-                paragraph "⚠ Number flic${desiredNum} is already in use by another configured device. Choose a different number."
-            }
+            paragraph "Device Name: ${b.name}\nDevice Type: ${inferredType}"
 
             state.rt = (state.rt ?: [:])
             state.rt.removeBdaddr = bdaddr
@@ -520,9 +500,9 @@ def renderButtonConfigSection(String bdaddr, def discovered) {
 
     section("Button actions") {
         input clicksModeKey, "enum",
-            title: "Actions",
+            title: "Control a virtual or HE device?",
             required: false,
-            options: ["virtual":"Virtual Button device", "real":"HE device(s)"],
+            options: ["virtual":"Create a virtual button device", "real":"HE device(s)"],
             defaultValue: (settings[clicksModeKey]),
             submitOnChange: true
 
@@ -912,12 +892,47 @@ private void renderFlicAppInstructions(String bdaddr) {
     def cfg = (state.configured ?: [:])[normBdaddr(bdaddr)]
     if (!cfg) return
 
-    Integer flicNum = cfg.flicNum
-    Map mappings = cfg.mappings ?: [:]
-    if (!flicNum || !mappings) return
+    Integer flicNum = null
+    try { flicNum = (cfg?.flicNum as Integer) } catch (ignored) { flicNum = null }
+
+    // Keys + uniqueness checks
+    String flicNumKey = k(bdaddr, "flic_num")
+    Set<Integer> usedNums = usedFlicNums(bdaddr)
+
+    // What the user is currently trying to set (or current stored number)
+    Integer desiredNum = safeInt(settings[flicNumKey], flicNum)
+
+    String cfgType = (cfg?.type ?: "").toString()
 
     section("<b>📱 Flic Mobile App Setup</b>") {
-        paragraph buildFlicInstructionsText(flicNum, mappings)
+
+        if (flicNum != null) {
+            paragraph "<b>Unique Device Number:</b> flic${flicNum}"
+        }
+
+        input flicNumKey, "number",
+            title: "Edit Device Number (unique number used to configure actions in the Flic mobile app):",
+            required: true,
+            defaultValue: (settings[flicNumKey] != null ? settings[flicNumKey] : flicNum),
+            submitOnChange: true
+
+        if (desiredNum != null && desiredNum > 0 && usedNums.contains(desiredNum)) {
+            paragraph "⚠ Number flic${desiredNum} is already in use by another configured device. Choose a different number."
+        }
+
+        // ✅ Buttons: explicitly tell user Mobile App config is not required
+        if (cfgType == "button") {
+            paragraph "<b>Configuration in the Flic Mobile App is not required for Flic Buttons.</b><br>This section only applies to <b>Flic Twist</b>."
+            return
+        }
+
+        // Twist instructions content (existing behaviour)
+        Map mappings = (cfg?.mappings ?: [:]) as Map
+        if (flicNum && mappings && mappings.size() > 0) {
+            paragraph buildFlicInstructionsText(flicNum, mappings)
+        } else {
+            paragraph "Configure the options above, then your Flic Mobile App setup instructions will appear here."
+        }
     }
 }
 
