@@ -1,5 +1,5 @@
 /**
- *  Flic Integration (Buttons & Twist) V1.0
+ *  Flic Integration (Buttons & Twist) V1.1
  */
 
 import groovy.json.JsonOutput
@@ -35,10 +35,10 @@ import groovy.transform.Field
 @Field Integer SYNC_DEDUP_MS     = 400      // optional dedupe window for same value spam
 
 definition(
-    name: "Flic Integration V1.0",
+    name: "Flic Integration",
     namespace: "local.flic",
     author: "Robin Winbourne",
-    description: "Discover Flic devices via TCP, configure mappings, push config to Studio module, receive and act upon Flic events and sync HE devices to Flic Virtual devices",
+    description: "Discover Flic devices via TCP and Sync actions with Hubitat",
     category: "Convenience",
     singleInstance: true,
     oauth: true,
@@ -73,9 +73,10 @@ def initialize() {
     if (state.rt.lastSelectorClickMs == null) state.rt.lastSelectorClickMs = [:]
 
     ensureAutoNumbers()
-
+    invalidateSetConfigCache()
     setupTwoWaySync()
 }
+
 
 /* ---------------- Logging helpers ---------------- */
 
@@ -275,6 +276,13 @@ private void resetPushTwistSection(String bdaddr) {
         }
     }
 }
+
+private void invalidateSetConfigCache() {
+    if (state?.rt == null) state.rt = [:]
+    state.rt.lastSetConfigResult = null
+    state.rt.lastSetConfigHash = null
+}
+
 
 /* ---------------- Auto-label detection + mode-change helpers ---------------- */
 
@@ -1087,6 +1095,7 @@ private void removeConfiguredDevice(String bdaddrIn) {
 
     // Re-assert uniqueness / fill any gaps
     ensureAutoNumbers()
+    invalidateSetConfigCache() 
 }
 
 
@@ -1173,6 +1182,7 @@ private void saveConfiguredDevice(String bdaddrIn, def discoveredButton, String 
     entry.mappings = newMappings
     cfg[bdaddr] = entry
     state.configured = cfg
+    invalidateSetConfigCache()
 }
 
 private void cleanupVirtualChildren(Map prevMappings, Map newMappings) {
@@ -1552,18 +1562,30 @@ def reviewPage() {
 private Map pushConfigToStudioOnce() {
     if (state?.rt == null) state.rt = [:]
 
-    // If we already attempted on this page render/session, return cached result
-    if (state.rt.lastSetConfigResult instanceof Map) {
+    String cfgHash = computeConfigHash()
+
+    // If we already sent for THIS EXACT CONFIG, return cached result
+    if ((state.rt.lastSetConfigResult instanceof Map) && (state.rt.lastSetConfigHash == cfgHash)) {
         return (state.rt.lastSetConfigResult as Map)
     }
 
+    // Otherwise resend and update cache
     Map result = pushConfigToStudioInternal()
-
-    // Cache result so re-renders don't resend SET_CONFIG
     state.rt.lastSetConfigResult = result
-
+    state.rt.lastSetConfigHash = cfgHash
     return result
 }
+
+private String computeConfigHash() {
+    // Anything that should trigger a re-push goes into this string:
+    def obj = [
+        host: (settings.flicHost ?: ""),
+        port: (settings.flicPort ?: ""),
+        configured: (state.configured ?: [:])
+    ]
+    return JsonOutput.toJson(obj)   // stable string; good enough as a "hash"
+}
+
 
 /**
  * Internal sender. Returns: [ok:<bool>, msg:<string>]
