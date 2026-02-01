@@ -12,6 +12,7 @@ This integration allows:
 ## Pre-requisites
 - Hubitat hub and Flic Hub must be on the same local network (LAN)
 - Flic Hub firmware must support SDK / Studio access
+- Flic Hub LR (Not Flic Hub Mini)
 
 ---
 
