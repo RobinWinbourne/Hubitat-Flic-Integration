@@ -530,7 +530,7 @@ private void renderTwistTargetPicker(String fn, String targetsKey, String titleO
     } else if (fn == "vol") {
         input targetsKey, "capability.audioVolume", title: (titleOverride ?: "Volume device(s)"), multiple: true, required: false
     } else if (fn == "blinds") {
-        input targetsKey, "capability.windowBlind", title: (titleOverride ?: "Blind(s)"), multiple: true, required: false
+        input targetsKey, "capability.windowShade", title: (titleOverride ?: "Shade(s) / Blind(s)"), multiple: true, required: false
     } else {
         input targetsKey, "capability.switchLevel", title: t, multiple: true, required: false
     }
