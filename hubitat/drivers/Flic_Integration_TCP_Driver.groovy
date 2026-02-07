@@ -4,7 +4,7 @@ import hubitat.helper.HexUtils
 
 metadata {
     definition(
-        name: "Flic Integration TCP Driver V1.0",
+        name: "Flic Integration TCP Driver",
         namespace: "local.flic",
         author: "Robin Winbourne",
         description: "One-shot TCP client for Flic Hub Studio (JSON lines) using rawSocket. Supports passing host/port per call.",
@@ -22,11 +22,14 @@ metadata {
         command "sendStatusTo", [[name:"host", type:"STRING"], [name:"port", type:"NUMBER"]]
         command "sendListButtonsTo", [[name:"host", type:"STRING"], [name:"port", type:"NUMBER"]]
         command "sendRawJsonTo", [[name:"host", type:"STRING"], [name:"port", type:"NUMBER"], [name:"jsonLine", type:"STRING"]]
+        command "clearHttpProxyResult"
 
         attribute "connection", "string"     // idle / connecting / connected / closing / error
         attribute "lastResponse", "string"
         attribute "lastHello", "string"
         attribute "lastNonHello", "string"
+        attribute "lastHttpProxyNonce", "string"
+        attribute "lastHttpProxyResult", "string"        
         attribute "lastSocketStatus", "string"
         attribute "lastError", "string"
         attribute "lastTarget", "string"     // host:port last used
@@ -51,8 +54,13 @@ def initialize() {
     state.closeScheduled = false
     state.overrideHost = null
     state.overridePort = null
+
+    // Track special long-running requests (HTTP proxy)
+    state.expectHttpProxyNonce = null
+
     sendEvent(name: "connection", value: "idle")
 }
+
 
 /* ---------------- Public commands ---------------- */
 
@@ -85,6 +93,12 @@ def sendRawJsonTo(String h, Number p, String jsonLine) {
     }
     requestOnceTo(h, p, line)
 }
+
+def clearHttpProxyResult() {
+    sendEvent(name: "lastHttpProxyNonce", value: "")
+    sendEvent(name: "lastHttpProxyResult", value: "")
+}
+
 
 /* ---------------- One-shot request core ---------------- */
 
@@ -123,7 +137,27 @@ private void requestOnce(String jsonLineNoNl) {
 
     state.rxBuf = ""
     state.closeScheduled = false
-    state.pendingLine = (jsonLineNoNl + "\n")
+
+    // Always send newline-terminated JSON
+    String lineToSend = (jsonLineNoNl + "\n")
+    state.pendingLine = lineToSend
+
+    // Detect HTTP_PROXY and extend socket lifetime
+    // (Studio may take up to ~6s; give it headroom)
+    state.expectHttpProxyNonce = null
+    Integer autoClose = ((settings.autoCloseMs ?: 2500) as Integer)
+
+    try {
+        // cheap detection without needing JSON parse
+        if (jsonLineNoNl?.contains('"cmd":"HTTP_PROXY"') || jsonLineNoNl?.contains('"cmd": "HTTP_PROXY"')) {
+            // pull nonce if present (best-effort)
+            def m = (jsonLineNoNl =~ /"nonce"\s*:\s*"([^"]+)"/)
+            if (m.find()) state.expectHttpProxyNonce = m.group(1)
+
+            // keep socket open longer for proxy response
+            autoClose = Math.max(autoClose, 10000) // 10 seconds
+        }
+    } catch (ignored) {}
 
     sendEvent(name: "connection", value: "connecting")
     logInfo "Connecting to ${targetHost}:${targetPort} (byteInterface=${settings.useByteInterface}) ..."
@@ -137,8 +171,9 @@ private void requestOnce(String jsonLineNoNl) {
     }
 
     runInMillis((settings.sendDelayMs ?: 250) as Integer, "flushPending")
-    runInMillis((settings.autoCloseMs ?: 2500) as Integer, "closeSocket")
+    runInMillis(autoClose, "closeSocket")
 }
+
 
 /**
  * rawSocket lifecycle callback (required name)
@@ -249,10 +284,26 @@ def parse(String message) {
 private void handleJsonLine(String line) {
     try {
         def obj = new JsonSlurper().parseText(line)
-        String pretty = JsonOutput.prettyPrint(JsonOutput.toJson(obj))
 
+        // Keep both raw-ish and pretty for debugging / UI
+        String pretty = JsonOutput.prettyPrint(JsonOutput.toJson(obj))
         sendEvent(name: "lastResponse", value: pretty)
 
+        // Special case: HTTP proxy results must land in the attributes your app polls
+        if (obj instanceof Map && (obj.cmd?.toString() == "HTTP_PROXY_RESULT")) {
+            String nonce = (obj.nonce ?: "").toString()
+            sendEvent(name: "lastHttpProxyNonce", value: nonce)
+            sendEvent(name: "lastHttpProxyResult", value: pretty)
+
+            // Once we got the proxy result, we can close soon
+            if (!state.closeScheduled) {
+                state.closeScheduled = true
+                runInMillis(350, "closeSocket")
+            }
+            return
+        }
+
+        // Existing hello/non-hello behavior
         if (obj instanceof Map && obj.hello) {
             sendEvent(name: "lastHello", value: pretty)
         } else {
@@ -267,6 +318,8 @@ private void handleJsonLine(String line) {
         setErr("parse_failed: ${e} (line=${line})")
     }
 }
+
+
 
 /* ---------------- Helpers ---------------- */
 
