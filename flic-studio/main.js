@@ -23,7 +23,11 @@
  * - When meta.pushSelect !== true (non-selector mode), we ignore actionMessage and use raw push events only (sel=0).
  *
  * TCP commands:
- * - PING / STATUS / LIST_BUTTONS / SET_CONFIG / CLEAR_CONFIG / UPDATE_VD / UPDATE_VD_STATE
+ * - PING / STATUS / LIST_BUTTONS / SET_CONFIG / CLEAR_CONFIG / UPDATE_VD / UPDATE_VD_STATE / HTTP_PROXY
+ *
+ * Notes about Flic Studio runtime:
+ * - Not full Node.js: do NOT use https/url/http.request/Buffer.
+ * - Use Studio-provided http.makeRequest().
  */
 
 const net = require("net");
@@ -37,9 +41,26 @@ const LISTEN_PORT = 46321;
 // ---------- tuning knobs ----------
 const TWIST_IDLE_SEND_MS = 250; // debounce/merge virtual updates
 const RELEASE_ARM_TIMEOUT_MS = 15000; // safety guard: "armed for release" expires after 15s
+const VD_MIN_DELTA_01 = 0.02; // ignore tiny jitter (>=2% change on 0..1 range required to send)
 
-// ignore tiny jitter (>=2% change on 0..1 range required to send)
-const VD_MIN_DELTA_01 = 0.02;
+// HTTP proxy tuning
+const HTTP_PROXY_TIMEOUT_MS = 3000; // keep tight; local LAN should be fast
+const HTTP_PROXY_MAX_BODY_CHARS = 25000;
+
+// ---------- logging knobs (reduced noise) ----------
+const LOG = {
+  hubitatSend: false,          // log every outbound Hubitat send (noisy with twists)
+  hubitatOk: false,            // log every Hubitat ok (noisy with twists)
+  hubitatErrors: true,         // keep errors
+  httpProxy: true,             // keep proxy recv/done (useful sanity check)
+  updateVdFromHubitat: true,   // log UPDATE_VD from Hubitat (usually low volume)
+};
+
+function logHubSend(msg) { if (LOG.hubitatSend) console.log(msg); }
+function logHubOk(msg) { if (LOG.hubitatOk) console.log(msg); }
+function logHubErr(msg) { if (LOG.hubitatErrors) console.log(msg); }
+function logProxy(msg) { if (LOG.httpProxy) console.log(msg); }
+function logUpdateVd(msg) { if (LOG.updateVdFromHubitat) console.log(msg); }
 
 // ---------- persistence ----------
 const DS_KEY = "hubitat_config"; // do not change unless you want to reset stored config
@@ -96,6 +117,7 @@ function isEnabled(bdaddr) {
   return !!(d && d.enabled !== false);
 }
 
+// ---------- Hubitat outbound events ----------
 function hubitatEvent(params) {
   if (!hubitat || !hubitat.base || !hubitat.appId || !hubitat.token) return;
 
@@ -123,18 +145,18 @@ function hubitatEvent(params) {
   });
   const brief = briefParts.join(" ");
 
-  console.log(`[${nowIso()}] [HUBITAT] send ${brief}`);
+  logHubSend(`[${nowIso()}] [HUBITAT] send ${brief}`);
 
   http.makeRequest({ url }, (err, resp) => {
     try {
       if (err) {
-        console.log(`[${nowIso()}] [HUBITAT] error ${brief} -> ${String(err)}`);
+        logHubErr(`[${nowIso()}] [HUBITAT] error ${brief} -> ${String(err)}`);
         return;
       }
       const status = (resp && (resp.statusCode || resp.status)) || "(unknown)";
-      console.log(`[${nowIso()}] [HUBITAT] ok ${brief} status=${status}`);
+      logHubOk(`[${nowIso()}] [HUBITAT] ok ${brief} status=${status}`);
     } catch (e) {
-      console.log(`[${nowIso()}] [HUBITAT] response parse error: ${String(e)}`);
+      logHubErr(`[${nowIso()}] [HUBITAT] response parse error: ${String(e)}`);
     }
   });
 }
@@ -157,11 +179,7 @@ function loadConfigFromStore(cb) {
           hubitat = obj.hubitat;
           devicesByBdaddr = obj.devicesByBdaddr;
           console.log(
-            `[${nowIso()}] [CONFIG] loaded: base=${hubitat.base} appId=${
-              hubitat.appId
-            } devices=${
-              Object.keys(devicesByBdaddr).length
-            } instanceId=${instanceId}`
+            `[${nowIso()}] [CONFIG] loaded: base=${hubitat.base} appId=${hubitat.appId} devices=${Object.keys(devicesByBdaddr).length} instanceId=${instanceId}`
           );
           return cb(true);
         }
@@ -516,10 +534,8 @@ function applyUpdateVdFromHubitat(msg) {
   const values = filterValuesByType(type, picked);
   if (Object.keys(values).length === 0) return { ok: false, err: "no_values" };
 
-  console.log(
-    `[${nowIso()}] [UPDATE_VD] from Hubitat bdaddr=${bdaddr} flicNum=${flicNum} id=${vdid} type=${type} values=${JSON.stringify(
-      values
-    )}`
+  logUpdateVd(
+    `[${nowIso()}] [UPDATE_VD] from Hubitat bdaddr=${bdaddr} flicNum=${flicNum} id=${vdid} type=${type} values=${JSON.stringify(values)}`
   );
 
   try {
@@ -529,6 +545,76 @@ function applyUpdateVdFromHubitat(msg) {
   } catch (e) {
     return { ok: false, err: "virtualDeviceUpdateState_failed", detail: String(e) };
   }
+}
+
+// ---------- HTTP proxy (Hubitat -> webCoRE via Studio) ----------
+// Keep minimal: http:// only, host allow-list (same host[:port] as hubitat.base, plus localhost/127.0.0.1).
+function hostFromHttpUrl(urlStr) {
+  const s = String(urlStr || "").trim();
+  const m = s.match(/^http:\/\/([^\/?#]+)(?:[\/?#]|$)/i);
+  if (!m) return null;
+  return String(m[1] || "").trim().toLowerCase(); // host[:port]
+}
+
+function isAllowedProxyUrl(urlStr) {
+  if (!hubitat || !hubitat.base) return false;
+
+  const allowed = hostFromHttpUrl(hubitat.base);
+  if (!allowed) return false;
+
+  const host = hostFromHttpUrl(urlStr);
+  if (!host) return false;
+
+  if (host === "localhost" || host === "127.0.0.1") return true;
+  return host === allowed;
+}
+
+function httpGetAsText(urlStr, timeoutMs, maxBodyChars) {
+  return new Promise((resolve) => {
+    const url = String(urlStr || "").trim();
+    if (!url) return resolve({ ok: false, status: 0, err: "empty_url" });
+    if (!/^http:\/\//i.test(url)) {
+      return resolve({ ok: false, status: 0, err: "only_http_supported" });
+    }
+
+    let done = false;
+    function finish(obj) {
+      if (done) return;
+      done = true;
+      resolve(obj);
+    }
+
+    const t = setTimeout(() => {
+      finish({ ok: false, status: 0, err: "timeout" });
+    }, timeoutMs);
+
+    try {
+      http.makeRequest({ url }, (err, resp) => {
+        clearTimeout(t);
+
+        if (err) return finish({ ok: false, status: 0, err: String(err) });
+
+        const status = (resp && (resp.statusCode || resp.status)) || 0;
+
+        // Studio may use resp.body or resp.data
+        let body =
+          (resp && resp.body != null ? String(resp.body) : null) ||
+          (resp && resp.data != null ? String(resp.data) : "") ||
+          "";
+
+        let truncated = false;
+        if (body.length > maxBodyChars) {
+          body = body.substring(0, maxBodyChars);
+          truncated = true;
+        }
+
+        finish({ ok: true, status, body, truncated });
+      });
+    } catch (e) {
+      clearTimeout(t);
+      finish({ ok: false, status: 0, err: String(e) });
+    }
+  });
 }
 
 // ---------- Studio listeners ----------
@@ -689,7 +775,7 @@ console.log("instanceId:");
 console.log(instanceId);
 console.log("TCP server listening port:");
 console.log(LISTEN_PORT);
-console.log("cmds: PING/STATUS/LIST_BUTTONS/SET_CONFIG/CLEAR_CONFIG/UPDATE_VD/UPDATE_VD_STATE");
+console.log("cmds: PING/STATUS/LIST_BUTTONS/SET_CONFIG/CLEAR_CONFIG/UPDATE_VD/UPDATE_VD_STATE/HTTP_PROXY");
 
 // Load persisted config
 loadConfigFromStore((ok) => {
@@ -884,9 +970,7 @@ const server = net.createServer((socket) => {
           });
 
           console.log(
-            `[${nowIso()}] [CONFIG] SET_CONFIG received: base=${hubitat.base} appId=${hubitat.appId} devices=${Object.keys(
-              devicesByBdaddr
-            ).length}`
+            `[${nowIso()}] [CONFIG] SET_CONFIG received: base=${hubitat.base} appId=${hubitat.appId} devices=${Object.keys(devicesByBdaddr).length}`
           );
 
           saveConfigToStore(() => {
@@ -916,6 +1000,104 @@ const server = net.createServer((socket) => {
       if (cmd === "UPDATE_VD" || cmd === "UPDATE_VD_STATE") {
         const res = applyUpdateVdFromHubitat(msg);
         sendLine(socket, { ...res, time: nowIso(), instanceId });
+        continue;
+      }
+
+      // Hubitat -> Studio -> Hubitat (webCoRE) proxy
+      if (cmd === "HTTP_PROXY") {
+        const nonce = safeStr(msg.nonce);
+        const method = String(msg.method || "GET").toUpperCase();
+        const url = safeStr(msg.url).trim();
+
+        if (!nonce) {
+          sendLine(socket, {
+            ok: false,
+            cmd: "HTTP_PROXY_RESULT",
+            nonce: "",
+            status: 0,
+            err: "missing_nonce",
+            time: nowIso(),
+            instanceId,
+          });
+          continue;
+        }
+
+        if (method !== "GET") {
+          sendLine(socket, {
+            ok: false,
+            cmd: "HTTP_PROXY_RESULT",
+            nonce,
+            status: 0,
+            err: "only_get_supported",
+            time: nowIso(),
+            instanceId,
+          });
+          continue;
+        }
+
+        if (!url) {
+          sendLine(socket, {
+            ok: false,
+            cmd: "HTTP_PROXY_RESULT",
+            nonce,
+            status: 0,
+            err: "missing_url",
+            time: nowIso(),
+            instanceId,
+          });
+          continue;
+        }
+
+        if (!hubitat || !hubitat.base) {
+          sendLine(socket, {
+            ok: false,
+            cmd: "HTTP_PROXY_RESULT",
+            nonce,
+            status: 0,
+            err: "not_configured",
+            time: nowIso(),
+            instanceId,
+          });
+          continue;
+        }
+
+        if (!isAllowedProxyUrl(url)) {
+          sendLine(socket, {
+            ok: false,
+            cmd: "HTTP_PROXY_RESULT",
+            nonce,
+            status: 0,
+            err: "proxy_denied_host",
+            allowedHost: hostFromHttpUrl(hubitat.base),
+            time: nowIso(),
+            instanceId,
+          });
+          continue;
+        }
+
+        logProxy(`[${nowIso()}] [HTTP_PROXY] recv nonce=${nonce} url=${url}`);
+
+        // Fire the GET. We still send HTTP_PROXY_RESULT, but keep the payload minimal unless it failed.
+        httpGetAsText(url, HTTP_PROXY_TIMEOUT_MS, HTTP_PROXY_MAX_BODY_CHARS).then((r) => {
+          logProxy(
+            `[${nowIso()}] [HTTP_PROXY] done nonce=${nonce} ok=${r.ok} status=${r.status} err=${r.err || ""}`
+          );
+
+          // "Send and forget" style: don't send big bodies back unless there was an error.
+          const includeBody = !(r && r.ok === true && (r.status === 200 || r.status === 204));
+          sendLine(socket, {
+            ok: r.ok === true,
+            cmd: "HTTP_PROXY_RESULT",
+            nonce,
+            status: r.status || 0,
+            body: includeBody ? (r.body || "") : "",
+            truncated: includeBody ? (r.truncated === true) : false,
+            err: r.ok ? "" : (r.err || "error"),
+            time: nowIso(),
+            instanceId,
+          });
+        });
+
         continue;
       }
 
