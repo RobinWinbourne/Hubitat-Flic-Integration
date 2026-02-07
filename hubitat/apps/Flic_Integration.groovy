@@ -1,5 +1,5 @@
 /**
- *  Flic Integration (Buttons & Twist) V1.1
+ *  Flic Integration (Buttons & Twist) V1.2
  */
 
 import groovy.json.JsonOutput
@@ -34,8 +34,10 @@ import groovy.transform.Field
 @Field Integer SYNC_SUPPRESS_MS = 1200      // ignore “bounce-back” device events for 1.2s
 @Field Integer SYNC_DEDUP_MS     = 400      // optional dedupe window for same value spam
 
+@Field Integer MAX_MULTI_ACTIONS = 5
+
 definition(
-    name: "Flic Integration",
+    name: "Flic Integration V1.2",
     namespace: "local.flic",
     author: "Robin Winbourne",
     description: "Discover Flic devices via TCP and Sync actions with Hubitat",
@@ -77,11 +79,130 @@ def initialize() {
     setupTwoWaySync()
 }
 
+def appButtonHandler(String btn) {
+    if (!btn) return
+
+    // Expected formats:
+    //  add|<bdaddr>|<keyPrefix>|<which>
+    //  rem|<bdaddr>|<keyPrefix>|<which>|<idx>
+    def parts = btn.toString().split("\\|") as List
+    if (!parts || parts.size() < 4) return
+
+    String op = parts[0]
+    String bdaddr = normBdaddr(parts[1])
+    String keyPrefix = parts[2]
+    String which = parts[3]
+
+    if (!bdaddr || !keyPrefix || !which) return
+
+    Integer n = getActionCount(bdaddr, keyPrefix, which)
+
+    if (op == "add") {
+        if (n < MAX_MULTI_ACTIONS) {
+            setActionCount(bdaddr, keyPrefix, which, n + 1)
+        }
+        return
+    }
+
+    if (op == "rem") {
+        Integer idx = (parts.size() >= 5) ? safeInt(parts[4], null) : null
+        if (idx == null) return
+        if (idx < 1 || idx > n) return
+
+        // Clear settings for the removed row
+        clearActionRowSettings(bdaddr, keyPrefix, which, idx)
+
+        // If removing a middle row, shift later rows down so UI stays compact
+        if (idx < n) {
+            (idx..(n - 1)).each { Integer i ->
+                Integer j = i + 1
+                shiftActionRowSettingsDown(bdaddr, keyPrefix, which, j, i)
+            }
+            // clear the old last row after shifting
+            clearActionRowSettings(bdaddr, keyPrefix, which, n)
+        }
+
+        // Decrease count (min 1)
+        setActionCount(bdaddr, keyPrefix, which, Math.max(1, n - 1))
+        return
+    }
+}
+
+/**
+ * Shift row "fromIdx" -> "toIdx" by copying settings values.
+ */
+private void shiftActionRowSettingsDown(String bdaddr, String keyPrefix, String which, Integer fromIdx, Integer toIdx) {
+    if (!fromIdx || !toIdx) return
+    if (fromIdx < 1 || toIdx < 1) return
+
+    String fromS = "_a${fromIdx}"
+    String toS   = "_a${toIdx}"
+
+    String fromActionKey  = k(bdaddr, "${keyPrefix}_${which}_action${fromS}")
+    String toActionKey    = k(bdaddr, "${keyPrefix}_${which}_action${toS}")
+
+    String fromTargetsKey = k(bdaddr, "${keyPrefix}_${which}_targets${fromS}")
+    String toTargetsKey   = k(bdaddr, "${keyPrefix}_${which}_targets${toS}")
+
+    // Read FROM action BEFORE we do anything that might confuse tracking
+    String fromAct = (settings[fromActionKey] ?: "none").toString()
+
+    // 1) Copy action enum first
+    copySetting(fromActionKey, "enum", toActionKey, "enum")
+
+    // --- NEW: keep uiPrev aligned so renderActionRowIndexed() doesn't think user changed action ---
+    uiPrevSetActForRow(bdaddr, keyPrefix, which, toIdx, fromAct)
+    // ------------------------------------------------------------------------------------------
+
+    // 2) Copy targets using capability type derived from the *from* row action
+    String capType = targetsInputTypeForAction(fromAct)
+    copyDeviceSetting(fromTargetsKey, toTargetsKey, capType)
+
+    // 3) Detail fields
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_level${fromS}"), "number",
+                k(bdaddr, "${keyPrefix}_${which}_level${toS}"), "number")
+
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_webcore_url${fromS}"), "text",
+                k(bdaddr, "${keyPrefix}_${which}_webcore_url${toS}"), "text")
+
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_ct${fromS}"), "number",
+                k(bdaddr, "${keyPrefix}_${which}_ct${toS}"), "number")
+
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_sat${fromS}"), "number",
+                k(bdaddr, "${keyPrefix}_${which}_sat${toS}"), "number")
+
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_vol${fromS}"), "number",
+                k(bdaddr, "${keyPrefix}_${which}_vol${toS}"), "number")
+
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_blind${fromS}"), "number",
+                k(bdaddr, "${keyPrefix}_${which}_blind${toS}"), "number")
+
+    copySetting(k(bdaddr, "${keyPrefix}_${which}_color${fromS}"), "color",
+                k(bdaddr, "${keyPrefix}_${which}_color${toS}"), "color")
+}
+
+
+/**
+ * Copy one setting key -> another (non-device types).
+ */
+private void copySetting(String fromKey, String fromType, String toKey, String toType) {
+    try {
+        def v = settings[fromKey]
+        if (v == null || v.toString() == "") {
+            clearSettingKey(toKey)
+            return
+        }
+        app.updateSetting(toKey, [type: toType, value: v])
+    } catch (ignored) { }
+}
+
 
 /* ---------------- Logging helpers ---------------- */
 
 private void infoEvt(String msg) { log.info msg }
 private void warnEvt(String msg) { log.warn msg }
+
+
 
 /* ---------------- Utils ---------------- */
 
@@ -94,6 +215,7 @@ private Integer safeInt(def s, Integer defVal) {
 private BigDecimal safeDec(def s, BigDecimal defVal) {
     try { return (s as BigDecimal) } catch (e) { return defVal }
 }
+
 
 private Integer clampInt(Integer v, Integer lo, Integer hi) {
     if (v == null) return lo
@@ -171,6 +293,18 @@ private boolean uiChanged(String bdaddr, String key, def newVal) {
     boolean changed = (prev != n)
     uiPrevSet(bdaddr, key, n)
     return changed
+}
+
+/** Keep uiPrev in-sync when we programmatically move action rows, so renderActionRowIndexed() doesn't auto-clear. */
+private void uiPrevSetActForRow(String bdaddr, String keyPrefix, String which, Integer idx, String act) {
+    String k0 = "act_${keyPrefix}_${which}_${idx}"
+    uiPrevSet(bdaddr, k0, (act ?: "none").toString())
+}
+
+/** Clear uiPrev tracking for an action row index (useful when deleting rows). */
+private void uiPrevClearActForRow(String bdaddr, String keyPrefix, String which, Integer idx) {
+    String k0 = "act_${keyPrefix}_${which}_${idx}"
+    uiPrevSet(bdaddr, k0, null)   // uiPrevGet() will treat as "no previous"
 }
 
 /** Safely clear a setting (device inputs, enum, number, text, bool). */
@@ -283,6 +417,95 @@ private void invalidateSetConfigCache() {
     state.rt.lastSetConfigHash = null
 }
 
+/**
+ * Determine the correct device-input type for a given action row,
+ * matching what renderActionRowIndexed() uses for targetsKey.
+ */
+private String targetsInputTypeForAction(String act) {
+    String a = (act ?: "none").toString()
+
+    if (a == "setLevel")            return "capability.switchLevel"
+    if (a == "lock" || a == "unlock") return "capability.lock"
+    if (a == "setColor")            return "capability.colorControl"
+    if (a == "setColorTemperature") return "capability.colorTemperature"
+    if (a == "setSaturation")       return "capability.colorControl"
+    if (a == "setVolume")           return "capability.audioVolume"
+    if (a == "blindsSetLevel")      return "capability.windowShade"
+
+    // webcore has no targets
+    if (a == "webcore")             return null
+
+    // toggle/on/off (and any other non-none) uses capability.switch
+    if (a != "none")                return "capability.switch"
+
+    return null
+}
+
+/**
+ * Copy a device input (single or multiple) from one setting key to another.
+ * Requires the correct "type" string (capability.*).
+ *
+ * IMPORTANT:
+ * settings[fromKey] returns DeviceWrapper or List<DeviceWrapper].
+ * app.updateSetting() expects device IDs (String or List<String>) for device inputs.
+ */
+private void copyDeviceSetting(String fromKey, String toKey, String capType) {
+    if (!fromKey || !toKey) return
+
+    // no targets for this action (or none selected)
+    if (!capType) {
+        clearSettingKey(toKey)
+        return
+    }
+
+    try {
+        def v = settings[fromKey]
+        if (v == null) {
+            clearSettingKey(toKey)
+            return
+        }
+
+        // Convert DeviceWrapper(s) -> device id string(s)
+        def ids = null
+
+        if (v instanceof List) {
+            List<String> out = []
+            v.each { d ->
+                try {
+                    if (d?.id != null) out << d.id.toString()
+                } catch (ignored) { }
+            }
+            ids = out
+        } else {
+            try {
+                if (v?.id != null) ids = v.id.toString()
+            } catch (ignored) { }
+        }
+
+        // If conversion failed or produced empty list, clear the destination
+        if (ids == null || (ids instanceof List && (ids as List).isEmpty())) {
+            clearSettingKey(toKey)
+            return
+        }
+
+        // ⭐ CRITICAL FIX:
+        // Hubitat can silently fail if a device-input key previously existed with a different capability type.
+        // Remove it first so it can be recreated with the new type.
+        try { app.removeSetting(toKey) } catch (ignored0) { }
+
+        app.updateSetting(toKey, [type: capType, value: ids])
+
+    } catch (ignored) {
+        // Fail safe: don't blow away other fields if something goes sideways
+        try { clearSettingKey(toKey) } catch (ignored2) {}
+    }
+}
+
+
+private void renderDivider() {
+    // Bold horizontal line between sections (kept inside current section to avoid reorder quirks)
+    paragraph "<hr style='border:0;border-top:3px solid #000;margin:14px 0;'/>"
+}
 
 /* ---------------- Auto-label detection + mode-change helpers ---------------- */
 
@@ -685,6 +908,7 @@ def renderTwistConfigSection(String bdaddr, def discovered) {
         } else if (settings[mClicksModeKey] == "real") {
             renderRealSwitchEventsBlock(bdaddr, "tw_m", "Master Button", (usePushTwist == false), (usePushTwist == false))
         }
+        renderDivider()
     }
 
     // ---------- PUSH & TWIST (secondary sel=1) ----------
@@ -736,6 +960,7 @@ def renderTwistConfigSection(String bdaddr, def discovered) {
             } else if ((ignorePushTwistSettingsThisRender ? (sModeVal) : settings[sTwistModeKey]) == "real") {
                 renderTwistTargetPicker(secFn, sTwistTargetsKey)
             }
+            renderDivider()
         }
     }
 
@@ -843,6 +1068,7 @@ def renderTwistConfigSection(String bdaddr, def discovered) {
                 } else if ((ignorePushTwistSettingsThisRender ? clicksModeVal : settings[sClicksModeKey]) == "real") {
                     renderRealSwitchEventsBlock(bdaddr, "tw_s${sel}", "${sel} o'clock Button", false, false)
                 }
+                renderDivider()
             }
         }
     }
@@ -864,37 +1090,185 @@ def renderRealSwitchEventsBlock(String bdaddr, String keyPrefix, String labelPre
 }
 
 private void renderActionRow(String bdaddr, String keyPrefix, String labelPrefix, String which, String whichLabel) {
+    Integer n = getActionCount(bdaddr, keyPrefix, which)
 
-    String actionKey = k(bdaddr, "${keyPrefix}_${which}_action")
-    String targetsKey = k(bdaddr, "${keyPrefix}_${which}_targets")
-    String levelKey = k(bdaddr, "${keyPrefix}_${which}_level")
+    // Inline (NO section wrapper) to prevent Hubitat re-ordering these blocks
+    paragraph "<b>${labelPrefix} — ${whichLabel}</b>"
+
+    // Render N actions
+    (1..n).each { Integer idx ->
+        renderActionRowIndexed(bdaddr, keyPrefix, labelPrefix, which, whichLabel, idx, n)
+    }
+
+    // Add another action button (up to MAX_MULTI_ACTIONS)
+    if (n < MAX_MULTI_ACTIONS) {
+        String btnName = "add|${normBdaddr(bdaddr)}|${keyPrefix}|${which}"
+        input btnName, "button",
+            title: "➕ Add another action",
+            submitOnChange: true
+    } else {
+        paragraph "Max actions reached (${MAX_MULTI_ACTIONS})."
+    }
+
+    // Small spacing between event blocks
+    paragraph ""
+}
+
+private void renderActionRowIndexed(
+    String bdaddr,
+    String keyPrefix,
+    String labelPrefix,
+    String which,
+    String whichLabel,
+    Integer idx,
+    Integer total
+) {
+    String suf = "_a${idx}"
+
+    String actionKey     = k(bdaddr, "${keyPrefix}_${which}_action${suf}")
+    String targetsKey    = k(bdaddr, "${keyPrefix}_${which}_targets${suf}")
+
+    String levelKey      = k(bdaddr, "${keyPrefix}_${which}_level${suf}")
+    String webcoreUrlKey = k(bdaddr, "${keyPrefix}_${which}_webcore_url${suf}")
+
+    String ctKey         = k(bdaddr, "${keyPrefix}_${which}_ct${suf}")
+    String satKey        = k(bdaddr, "${keyPrefix}_${which}_sat${suf}")
+    String volKey        = k(bdaddr, "${keyPrefix}_${which}_vol${suf}")
+    String blindKey      = k(bdaddr, "${keyPrefix}_${which}_blind${suf}")
+    String colorKey      = k(bdaddr, "${keyPrefix}_${which}_color${suf}")
+
+    // Row header + optional remove button (inline)
+    paragraph "<b>Action ${idx}</b>"
+
+    if (total > 1) {
+        String remBtn = "rem|${normBdaddr(bdaddr)}|${keyPrefix}|${which}|${idx}"
+        input remBtn, "button",
+            title: "➖ Remove action ${idx}",
+            submitOnChange: true
+    }
 
     input actionKey, "enum",
-        title: "${labelPrefix} — ${whichLabel}",
+        title: " ",
         required: false,
         options: [
-            "toggle":"Toggle",
-            "on":"On",
-            "off":"Off",
-            "setLevel":"Set Level"
+            "toggle"             : "Toggle",
+            "on"                 : "On",
+            "off"                : "Off",
+            "setLevel"           : "Set Level",
+            "lock"               : "Lock",
+            "unlock"             : "Unlock",
+            "setColor"           : "Set Color",
+            "setColorTemperature": "Set Color Temperature",
+            "setSaturation"      : "Set Saturation",
+            "setVolume"          : "Set Volume",
+            "blindsSetLevel"     : "Blinds Set Level",
+            "webcore"            : "Execute a webCoRE Piston / HTTP Get"
         ],
         defaultValue: (settings[actionKey]),
         submitOnChange: true
 
     String act = (settings[actionKey] ?: "none").toString()
 
+    // If action changed, clear fields that no longer apply
+    String trackKey = "act_${keyPrefix}_${which}_${idx}"
+    String prevAct = uiPrevGet(bdaddr, trackKey, "")
+    uiPrevSet(bdaddr, trackKey, act)
+
+    if (prevAct && prevAct != act) {
+        clearSettingKey(levelKey)
+        clearSettingKey(webcoreUrlKey)
+        clearSettingKey(ctKey)
+        clearSettingKey(satKey)
+        clearSettingKey(volKey)
+        clearSettingKey(blindKey)
+        clearSettingKey(colorKey)
+        clearSettingKey(targetsKey)
+    }
+
+    // ---- Per-action UI ----
+    if (act == "webcore") {
+        input webcoreUrlKey, "text",
+            title: "webCoRE External URL (HTTP GET)",
+            required: false,
+            submitOnChange: true
+        return
+    }
+
     if (act == "setLevel") {
-        // Only list devices that support setLevel
         input targetsKey, "capability.switchLevel", title: "Device(s)", multiple: true, required: false
-        input levelKey, "number", title: "Level (1-100)", required: true,
+        input levelKey, "number",
+            title: "Level (1–100)",
+            required: true,
             defaultValue: (settings[levelKey] != null ? settings[levelKey] : 100),
             range: "1..100",
             submitOnChange: true
-    } else if (act != "none") {
-        // Standard switch actions
+        return
+    }
+
+    if (act == "lock" || act == "unlock") {
+        input targetsKey, "capability.lock", title: "Lock(s)", multiple: true, required: false
+        return
+    }
+
+    if (act == "setColor") {
+        input targetsKey, "capability.colorControl", title: "Colour device(s)", multiple: true, required: false
+        input colorKey, "color",
+            title: "Pick a colour",
+            required: true,
+            submitOnChange: true
+        return
+    }
+
+    if (act == "setColorTemperature") {
+        input targetsKey, "capability.colorTemperature", title: "Colour temperature device(s)", multiple: true, required: false
+        input ctKey, "number",
+            title: "Colour temperature (Kelvin — typically 2000–6500)",
+            required: true,
+            defaultValue: (settings[ctKey] != null ? settings[ctKey] : 3000),
+            range: "2000..6500",
+            submitOnChange: true
+        return
+    }
+
+    if (act == "setSaturation") {
+        input targetsKey, "capability.colorControl", title: "Colour device(s)", multiple: true, required: false
+        input satKey, "number",
+            title: "Saturation (0–100)",
+            required: true,
+            defaultValue: (settings[satKey] != null ? settings[satKey] : 100),
+            range: "0..100",
+            submitOnChange: true
+        return
+    }
+
+    if (act == "setVolume") {
+        input targetsKey, "capability.audioVolume", title: "Volume device(s)", multiple: true, required: false
+        input volKey, "number",
+            title: "Volume (0–100)",
+            required: true,
+            defaultValue: (settings[volKey] != null ? settings[volKey] : 50),
+            range: "0..100",
+            submitOnChange: true
+        return
+    }
+
+    if (act == "blindsSetLevel") {
+        input targetsKey, "capability.windowShade", title: "Shade(s) / Blind(s)", multiple: true, required: false
+        input blindKey, "number",
+            title: "Position (0–100)",
+            required: true,
+            defaultValue: (settings[blindKey] != null ? settings[blindKey] : 50),
+            range: "0..100",
+            submitOnChange: true
+        return
+    }
+
+    if (act != "none") {
         input targetsKey, "capability.switch", title: "Device(s)", multiple: true, required: false
+        return
     }
 }
+
 
 private void renderFlicAppInstructions(String bdaddr) {
     def cfg = (state.configured ?: [:])[normBdaddr(bdaddr)]
@@ -1366,13 +1740,55 @@ private Map buildTwistClicksBlock(String bdaddr, Integer sel, boolean isMaster, 
 }
 
 private Map buildRealEventActionKey(String bdaddr, String keyPrefix, String which) {
-    String actionKey = k(bdaddr, "${keyPrefix}_${which}_action")
-    String targetsKey = k(bdaddr, "${keyPrefix}_${which}_targets")
-    String levelKey = k(bdaddr, "${keyPrefix}_${which}_level")
-    String action = (settings[actionKey] ?: "none").toString()
-    Integer level = safeInt(settings[levelKey], null)
-    return [action: action, targetsKey: targetsKey, level: level]
+
+    Integer n = getActionCount(bdaddr, keyPrefix, which)
+    List<Map> actions = []
+
+    (1..n).each { Integer idx ->
+        String suf = "_a${idx}"
+
+        String actionKey     = k(bdaddr, "${keyPrefix}_${which}_action${suf}")
+        String targetsKey    = k(bdaddr, "${keyPrefix}_${which}_targets${suf}")
+
+        String levelKey      = k(bdaddr, "${keyPrefix}_${which}_level${suf}")
+        String webcoreUrlKey = k(bdaddr, "${keyPrefix}_${which}_webcore_url${suf}")
+
+        String ctKey         = k(bdaddr, "${keyPrefix}_${which}_ct${suf}")
+        String satKey        = k(bdaddr, "${keyPrefix}_${which}_sat${suf}")
+        String volKey        = k(bdaddr, "${keyPrefix}_${which}_vol${suf}")
+        String blindKey      = k(bdaddr, "${keyPrefix}_${which}_blind${suf}")
+
+        String colorKey      = k(bdaddr, "${keyPrefix}_${which}_color${suf}")
+
+        String action = (settings[actionKey] ?: "none").toString()
+        if (!action || action == "none") return
+
+        Integer level = safeInt(settings[levelKey], null)
+        Integer ct    = safeInt(settings[ctKey], null)
+        Integer sat   = safeInt(settings[satKey], null)
+        Integer vol   = safeInt(settings[volKey], null)
+        Integer blind = safeInt(settings[blindKey], null)
+
+        String colorHex = (settings[colorKey] != null) ? settings[colorKey].toString().trim() : null
+
+        actions << [
+            action    : action,
+            targetsKey: targetsKey,
+            level     : level,
+            urlKey    : webcoreUrlKey,
+            ct        : ct,
+            sat       : sat,
+            vol       : vol,
+            blind     : blind,
+            colorHex  : colorHex
+        ]
+    }
+
+    return [
+        actions: actions
+    ]
 }
+
 
 /* ---------------- Child device creation helpers ---------------- */
 
@@ -1910,13 +2326,19 @@ private void applyClicksBlock(Map clicksBlock, String event, boolean ignoreHold)
     }
 
     if (mode == "real") {
-        Map rule = (event == "event1") ? (clicksBlock?.event1 ?: [:])
+        Map bundle = (event == "event1") ? (clicksBlock?.event1 ?: [:])
             : (event == "event2") ? (clicksBlock?.event2 ?: [:])
             : (event == "eventH") ? (clicksBlock?.eventH ?: [:])
             : (event == "release") ? (clicksBlock?.release ?: [:])
             : [:]
 
-        applySwitchAction(rule?.action, rule?.targetsKey, rule?.level)
+        def acts = bundle?.actions
+        if (acts instanceof List) {
+            acts.each { a -> applySwitchAction(a as Map) }
+        } else if (bundle instanceof Map) {
+            // backward compatibility (if any old configs exist)
+            applySwitchAction(bundle as Map)
+        }
         return
     }
 }
@@ -1958,34 +2380,140 @@ private void toggleSwitch(def ch) {
     } catch (ignored) {}
 }
 
-private void applySwitchAction(String action, String targetsKey, Integer level) {
-    String a = (action ?: "none").toLowerCase()
+private void applySwitchAction(Map rule) {
+    if (!rule) return
+
+    String a = (rule?.action ?: "none").toString().toLowerCase()
     if (a == "none") return
 
+    // webCoRE: per-event HTTP GET
+    if (a == "webcore") {
+        String url = ""
+        try { url = (rule?.urlKey ? (settings[rule.urlKey] ?: "") : "").toString().trim() } catch (ignored) {}
+        if (!url) return
+        execWebcoreHttpGet(url)
+        return
+    }
+
+    String targetsKey = (rule?.targetsKey ?: "").toString()
     def devs = targetsKey ? settings[targetsKey] : null
     if (!devs) return
 
-    Integer lvl = null
-    if (a == "setlevel") {
-        lvl = clampInt((level != null ? level : 100), 1, 100)
-    }
-
     devs.each { d ->
+        if (!d) return
         try {
+
             if (a == "on") {
                 d.on()
-            } else if (a == "off") {
+                return
+            }
+
+            if (a == "off") {
                 d.off()
-            } else if (a == "setlevel") {
-                try { d.setLevel(lvl) } catch (ignored) { }
-                try { d.on() } catch (ignored) { }
-            } else {
+                return
+            }
+
+            if (a == "toggle") {
                 def sw = (d.currentValue("switch") ?: "off") as String
                 if (sw == "on") d.off() else d.on()
+                return
             }
-        } catch (ignored) {}
+
+            if (a == "setlevel") {
+                Integer lvl = clampInt((rule?.level != null ? (rule.level as Integer) : 100), 1, 100)
+                try { d.setLevel(lvl) } catch (ignored) { }
+                try { d.on() } catch (ignored) { }
+                return
+            }
+
+            if (a == "lock") {
+                try { d.lock() } catch (ignored) { }
+                return
+            }
+
+            if (a == "unlock") {
+                try { d.unlock() } catch (ignored) { }
+                return
+            }
+
+            if (a == "setcolortemperature") {
+                Integer kMin = 2000
+                Integer kMax = 6500
+                Integer k = clampInt((rule?.ct != null ? (rule.ct as Integer) : 3000), kMin, kMax)
+                try { d.setColorTemperature(k) } catch (ignored) { }
+                return
+            }
+
+            if (a == "setsaturation") {
+                Integer sat = clampInt((rule?.sat != null ? (rule.sat as Integer) : 100), 0, 100)
+                try { d.setColor([hue: safeInt(d.currentValue("hue"), 0) ?: 0, saturation: sat, level: safeInt(d.currentValue("level"), 100) ?: 100]) } catch (ignored) { }
+                return
+            }
+
+            if (a == "setvolume") {
+                Integer vol = clampInt((rule?.vol != null ? (rule.vol as Integer) : 50), 0, 100)
+                try { d.setVolume(vol) } catch (ignored) { }
+                // some drivers expose level instead of volume
+                try { d.setLevel(vol) } catch (ignored) { }
+                return
+            }
+
+            if (a == "blindssetlevel") {
+                Integer pos = clampInt((rule?.blind != null ? (rule.blind as Integer) : 50), 0, 100)
+                // Most shade drivers use setPosition; some accept setLevel
+                try { d.setPosition(pos) } catch (ignored) { }
+                try { d.setLevel(pos) } catch (ignored) { }
+                return
+            }
+
+            if (a == "setcolor") {
+
+                String hex = (rule?.colorHex != null) ? rule.colorHex.toString().trim() : null
+                if (!hex) return
+                if (!hex.startsWith("#")) hex = "#${hex}"
+                if (!(hex ==~ /^#[0-9a-fA-F]{6}$/)) return
+
+                Integer r = Integer.parseInt(hex.substring(1, 3), 16)
+                Integer g = Integer.parseInt(hex.substring(3, 5), 16)
+                Integer b = Integer.parseInt(hex.substring(5, 7), 16)
+
+                // RGB(0..255) -> HSV; then Hue(0..100), Sat(0..100), Level(0..100)
+                double rf = r / 255.0d
+                double gf = g / 255.0d
+                double bf = b / 255.0d
+
+                double cMax = Math.max(rf, Math.max(gf, bf))
+                double cMin = Math.min(rf, Math.min(gf, bf))
+                double delta = cMax - cMin
+
+                double hDeg
+                if (delta == 0.0d) {
+                    hDeg = 0.0d
+                } else if (cMax == rf) {
+                    hDeg = 60.0d * (((gf - bf) / delta) % 6.0d)
+                } else if (cMax == gf) {
+                    hDeg = 60.0d * (((bf - rf) / delta) + 2.0d)
+                } else {
+                    hDeg = 60.0d * (((rf - gf) / delta) + 4.0d)
+                }
+                if (hDeg < 0.0d) hDeg += 360.0d
+
+                double s01 = (cMax == 0.0d) ? 0.0d : (delta / cMax)
+                double v01 = cMax
+
+                Integer huePct = clampInt((int)Math.round((hDeg / 360.0d) * 100.0d), 0, 100)
+                Integer satPct = clampInt((int)Math.round(s01 * 100.0d), 0, 100)
+                Integer levPct = clampInt((int)Math.round(v01 * 100.0d), 0, 100)
+
+                try { d.setColor([hue: huePct, saturation: satPct, level: levPct]) } catch (ignored) { }
+                try { d.on() } catch (ignored) { } // turns on light when chnaging color... comment out this line if you prefer to disable this "feature"
+                return
+
+            }
+        } catch (ignoredAll) { }
     }
 }
+
 
 /* ---------------- Response helpers ---------------- */
 
@@ -2307,6 +2835,195 @@ private boolean isDuplicateSend(String bdaddr, Integer sel, String fn, Map paylo
     return false
 }
 
+
+/* ---------------- Multi-action counts (per bdaddr + event) ---------------- */
+
+private Map actionCounts() {
+    if (state.rt == null) state.rt = [:]
+    if (!(state.rt.actionCounts instanceof Map)) state.rt.actionCounts = [:]
+    return (state.rt.actionCounts as Map)
+}
+
+private Integer getActionCount(String bdaddr, String keyPrefix, String which) {
+    String bd = normBdaddr(bdaddr)
+    if (!bd) return 1
+    Map all = actionCounts()
+    String k0 = "${bd}|${keyPrefix}|${which}"
+    Integer n = safeInt(all[k0], 1)
+    n = clampInt(n, 1, MAX_MULTI_ACTIONS)
+    all[k0] = n
+    state.rt.actionCounts = all
+    return n
+}
+
+private void setActionCount(String bdaddr, String keyPrefix, String which, Integer n) {
+    String bd = normBdaddr(bdaddr)
+    if (!bd) return
+    Integer nn = clampInt(n ?: 1, 1, MAX_MULTI_ACTIONS)
+    Map all = actionCounts()
+    String k0 = "${bd}|${keyPrefix}|${which}"
+    all[k0] = nn
+    state.rt.actionCounts = all
+}
+
+/**
+ * Clear ALL setting keys for a given action row index (so removing a row cleans up).
+ * idx is 1-based.
+ */
+private void clearActionRowSettings(String bdaddr, String keyPrefix, String which, Integer idx) {
+    if (!idx || idx < 1) return
+    String suf = "_a${idx}"
+
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_action${suf}"))
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_targets${suf}"))
+
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_level${suf}"))
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_webcore_url${suf}"))
+
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_ct${suf}"))
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_sat${suf}"))
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_vol${suf}"))
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_blind${suf}"))
+    clearSettingKey(k(bdaddr, "${keyPrefix}_${which}_color${suf}"))
+
+    // prevent stale prevAct causing clears next time this index is reused
+    uiPrevClearActForRow(bdaddr, keyPrefix, which, idx)
+}
+
+
+/* ---------- webCoRE / Local HTTP GET Helpers ---------- */
+
+private void execWebcoreHttpGet(String url) {
+    try {
+        String u = (url ?: "").toString().trim()
+        if (!u) return
+
+        // If the URL points back to THIS Hubitat hub, proxy via Flic Studio
+        if (isHubSelfUrl(u)) {
+            Map r = execHttpGetViaStudioProxy(u, 6000) // 6s timeout
+            if (!(r?.ok == true)) {
+                warnEvt "webCoRE GET via Studio proxy failed: ${r?.status ?: ""} ${r?.err ?: ""}"
+            }
+            return
+        }
+
+        // Otherwise do it directly (LAN device or external URL)
+        httpGet([uri: u, contentType: "text/plain"]) { resp ->
+            // optional: inspect resp.status / resp.data
+        }
+
+    } catch (e) {
+        warnEvt "webCoRE HTTP GET failed: ${e}"
+    }
+}
+
+/* ---------- Hub self-detection helpers (NO java.net imports) ---------- */
+
+private String hubLocalIp() {
+    try {
+        def h = location?.hubs?.find { true }
+        return (h?.localIP ?: h?.localIPaddress ?: h?.localIp)?.toString()
+    } catch (ignored) {
+        return null
+    }
+}
+
+/**
+ * Extract host from URL using regex only (Hubitat-safe).
+ * Supports:
+ *  - http://host:port/path
+ *  - https://host/path
+ *  - host:port/path   (scheme auto-added)
+ */
+private String urlHost(String url) {
+    if (!url) return null
+    String u = url.toString().trim()
+    if (!u) return null
+
+    // Add scheme if missing so regex is consistent
+    String ul = u.toLowerCase()
+    if (!(ul.startsWith("http://") || ul.startsWith("https://"))) {
+        u = "http://${u}"
+    }
+
+    def m = (u =~ /^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/([^\/:\?#]+).*/)
+    if (m.matches()) {
+        return m[0][1]?.toString()
+    }
+    return null
+}
+
+private boolean isHubSelfUrl(String url) {
+    String host = urlHost(url)
+    if (!host) return false
+
+    String hubIp = hubLocalIp()
+    if (!hubIp) return false
+
+    host = host.trim().toLowerCase()
+    hubIp = hubIp.trim().toLowerCase()
+
+    return (host == hubIp || host == "localhost" || host == "127.0.0.1")
+}
+
+/**
+ * Proxy a GET through Flic Studio (used when Hubitat cannot call itself),
+ * returns:
+ *   [ok:true/false, status:int, body:String, err:String]
+ */
+private Map execHttpGetViaStudioProxy(String url, Integer timeoutMs = 5000) {
+    if (!settings.flicHost || !settings.flicPort) {
+        return [ok:false, err:"missing_flic_host_port"]
+    }
+
+    def tcp = ensureTcpChild()
+    if (!tcp) return [ok:false, err:"missing_tcp_child"]
+
+    // Hubitat-safe nonce (no Random())
+    String nonce = "${now()}-${Math.abs((now() as Long).hashCode() % 100000)}"
+
+    // Clear any stale previous result
+    try { tcp.clearHttpProxyResult() } catch (ignored) {}
+
+    Map payload = [
+        cmd    : "HTTP_PROXY",
+        nonce  : nonce,
+        method : "GET",
+        url    : url
+    ]
+
+    try {
+        tcp.sendRawJsonTo(
+            settings.flicHost.toString(),
+            (settings.flicPort as Integer),
+            JsonOutput.toJson(payload)
+        )
+    } catch (e) {
+        return [ok:false, err:"send_failed:${e}"]
+    }
+
+    // Wait synchronously for Studio response
+    Long start = now()
+    while ((now() - start) < (timeoutMs as Long)) {
+        try {
+            String lastNonce = (tcp.currentValue("lastHttpProxyNonce") ?: "").toString()
+            String raw = (tcp.currentValue("lastHttpProxyResult") ?: "").toString()
+
+            if (raw && lastNonce == nonce) {
+                try {
+                    return (new JsonSlurper().parseText(raw) as Map)
+                } catch (e2) {
+                    return [ok:false, err:"bad_json:${e2}", raw: raw]
+                }
+            }
+        } catch (ignored) {}
+
+        pauseExecution(150)
+    }
+
+    return [ok:false, err:"timeout_waiting_proxy_result"]
+}
+
 /* ---------- Studio push ---------- */
 
 private void pushUpdateVdToStudio(String bdaddr, Integer sel, String kind, String dimmableType, Map values01) {
@@ -2318,7 +3035,7 @@ private void pushUpdateVdToStudio(String bdaddr, Integer sel, String kind, Strin
     Map payload = [
         cmd         : "UPDATE_VD",
         origin      : "hubitat",
-        nonce       : "${now()}-${new Random().nextInt(100000)}",
+        nonce       : "${now()}-${Math.abs((now() as Long).hashCode() % 100000)}",
         bdaddr      : normBdaddr(bdaddr),
         sel         : (sel != null ? sel : 0),
         kind        : (kind ?: ""),
