@@ -1380,6 +1380,23 @@ private String vdKind(String fn) {
     return "dimmer"
 }
 
+private boolean hasAnyRealActions(def bundle) {
+    if (!bundle) return false
+
+    // New format: [actions: [ {action:...}, ... ]]
+    def acts = bundle?.actions
+    if (acts instanceof List) {
+        return acts.any { a ->
+            String act = (a?.action ?: "none").toString()
+            return act && act != "none"
+        }
+    }
+
+    // Backward compat (older configs): [action:"on", ...]
+    String single = (bundle?.action ?: "none").toString()
+    return (single && single != "none")
+}
+
 private void addClickLines(
     List<String> lines,
     Integer flicNum,
@@ -1392,24 +1409,23 @@ private void addClickLines(
     String mode = (clicks.mode ?: "none").toString()
     if (mode == "none") return
 
+    // REAL mode: only show message lines if the event has at least one configured action
     if (mode == "real") {
-        if (clicks.event1?.action && clicks.event1.action != "none") {
-            lines << "${indent}• Push = Advanced → Flic Hub Studio → Message: <b>flic${flicNum}-button${sel}-event1</b>"
-        }
-        if (clicks.event2?.action && clicks.event2.action != "none") {
-            lines << "${indent}• Double Push = Advanced → Flic Hub Studio → Message: <b>flic${flicNum}-button${sel}-event2</b>"
-        }
+        boolean e1 = hasAnyRealActions(clicks?.event1)
+        boolean e2 = hasAnyRealActions(clicks?.event2)
+
+        if (e1) lines << "${indent}• Push = Advanced → Flic Hub Studio → Message: <b>flic${flicNum}-button${sel}-event1</b>"
+        if (e2) lines << "${indent}• Double Push = Advanced → Flic Hub Studio → Message: <b>flic${flicNum}-button${sel}-event2</b>"
         return
     }
 
-    // virtual mode: still need Studio messages so Hubitat can fire the virtual button child
+    // VIRTUAL mode: always show both messages (still required to trigger the virtual button child)
     if (mode == "virtual") {
         lines << "${indent}• Push = Advanced → Flic Hub Studio → Message: <b>flic${flicNum}-button${sel}-event1</b>"
         lines << "${indent}• Double Push = Advanced → Flic Hub Studio → Message: <b>flic${flicNum}-button${sel}-event2</b>"
         return
     }
 }
-
 
 
 /* ---------------- Save config + child cleanup ---------------- */
